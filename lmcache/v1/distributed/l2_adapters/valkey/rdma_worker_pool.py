@@ -4,18 +4,27 @@ Valkey worker pool that moves KV cache bytes over RDMA.
 
 ``ValkeyRdmaWorkerPool`` is the ``ValkeyWorkerPool`` behind the ``valkey``
 adapter's ``transport: "rdma"``: its SET and GET never carry the value in the
-RESP stream. Each worker thread's glide client registers the whole L1 arena
-once; every operation then names a window of that registration, and the
-server moves the bytes itself with the valkey-large-object module's
-``BLOB.RDMA_GET`` / ``BLOB.RDMA_SET``.
+RESP stream. Each worker thread's glide client registers the L1 arena, or
+one slice of it, once; every operation then names a window of that
+registration, and the server moves the bytes itself with the
+valkey-large-object module's ``BLOB.RDMA_GET`` / ``BLOB.RDMA_SET``.
 
 One registration per worker is forced by glide's API: an ``RdmaRegion`` is
 bound to the client that registered it and carries one transfer at a time.
 On a host with several fabric cards, ``rdma_interface`` may list them and the
 workers are spread across the cards round-robin, so the transfers in flight
 are not all funnelled through one card.
+
+With ``l1_slices > 1`` the arena is cut into that many slices and the
+workers into as many lanes; a lane's workers register only its slice, and a
+SET or GET runs on the lane whose slice holds its buffer. Each slice reaches
+``l1_slice_overlap`` bytes into the next one, so an object that starts in a
+slice and is no larger than the overlap lies wholly inside it: the L1
+allocator places objects at any aligned offset, so some do cross the
+boundary between two slices.
 The window is derived from the ``memoryview`` the adapter already passes, so
-the submit API is unchanged. A buffer outside the arena fails its key.
+the submit API is unchanged. A buffer outside the arena, or one crossing the
+end of its slice, fails its key.
 
 The keys are the module's own data type, so a plain ``GET`` / ``SET`` cannot
 read or replace them. ``EXISTS`` and ``DEL`` are inherited unchanged, and
@@ -48,6 +57,9 @@ RDMA_PROVIDERS: tuple[str, ...] = ("efa-direct", "tcp")
 
 #: First ``valkey-glide-sync`` release whose sync client exposes the RDMA API.
 RDMA_MIN_GLIDE_VERSION: str = "2.6.0"
+
+#: Slices start on a page boundary of the arena.
+L1_SLICE_ALIGN_BYTES: int = 4096
 
 T = TypeVar("T")
 
@@ -96,12 +108,14 @@ class ValkeyRdmaWorkerPool(ValkeyWorkerPool):
         l1_size: int,
         rdma_provider: str = "efa-direct",
         rdma_interface: Optional[Union[str, Sequence[str]]] = None,
+        l1_slices: int = 1,
+        l1_slice_overlap: int = 0,
         **pool_kwargs: Any,
     ) -> None:
         """Validate the RDMA settings, then build and warm up the pool.
 
-        Warm-up registers the arena on every worker, so a setup that cannot do
-        RDMA fails here rather than on the first transfer.
+        Warm-up registers each worker's slice of the arena, so a setup that
+        cannot do RDMA fails here rather than on the first transfer.
 
         Args:
             l1_base: Virtual address where the L1 arena starts (> 0).
@@ -111,6 +125,11 @@ class ValkeyRdmaWorkerPool(ValkeyWorkerPool):
             rdma_interface: Fabric domain, or domains, to open on a multi-card
                 host; workers take them round-robin. ``None`` lets the provider
                 choose.
+            l1_slices: Slices to cut the arena into; ``num_workers`` must be a
+                multiple of it. ``1`` (default) has every worker register the
+                whole arena.
+            l1_slice_overlap: Bytes each slice reaches into the next; must be
+                at least the largest object that is transferred.
             **pool_kwargs: Forwarded to ``ValkeyWorkerPool``.
 
         Raises:
@@ -127,29 +146,48 @@ class ValkeyRdmaWorkerPool(ValkeyWorkerPool):
                 f"rdma_provider must be one of {RDMA_PROVIDERS}, got {rdma_provider!r}"
             )
         interfaces = normalize_rdma_interfaces(rdma_interface)
+        if l1_slices <= 0:
+            raise ValueError(f"l1_slices must be > 0, got {l1_slices}")
+        # Slice i starts at i * stride and ends overlap bytes past the next
+        # start, or at the end of the arena.
+        stride = -(-l1_size // l1_slices)
+        stride = -(-stride // L1_SLICE_ALIGN_BYTES) * L1_SLICE_ALIGN_BYTES
+        if (l1_slices - 1) * stride >= l1_size:
+            raise ValueError(
+                f"an L1 arena of {l1_size} bytes is too small for {l1_slices} "
+                f"slices starting {L1_SLICE_ALIGN_BYTES}-byte aligned"
+            )
 
         self._l1_base: int = l1_base
         self._l1_size: int = l1_size
         self._rdma_provider: str = rdma_provider
         self._rdma_interfaces: tuple[str, ...] = interfaces
-        # Workers take an interface in client-creation order.
-        self._next_client_index: int = 0
-        self._client_index_lock = threading.Lock()
-        # A buffer-protocol view of the arena for registration; the L1 manager
-        # owns the memory.
-        self._l1_memory = (ctypes.c_ubyte * l1_size).from_address(l1_base)
+        self._slice_stride: int = stride
+        self._slices: list[tuple[int, int]] = [
+            (i * stride, min((i + 1) * stride + l1_slice_overlap, l1_size))
+            for i in range(l1_slices)
+        ]
+        # A buffer-protocol view of each slice for registration; the L1
+        # manager owns the memory.
+        self._slice_memory = [
+            (ctypes.c_ubyte * (end - start)).from_address(l1_base + start)
+            for start, end in self._slices
+        ]
 
-        super().__init__(**pool_kwargs)
+        super().__init__(num_lanes=l1_slices, **pool_kwargs)
 
         logger.info(
             "ValkeyRdmaWorkerPool: provider=%s interfaces=%s l1_arena=[%#x, %#x) "
-            "(%d bytes) on %d workers",
+            "(%d bytes) in %d slice(s) on %d workers, %d bytes registered on "
+            "the busiest device",
             rdma_provider,
             interfaces or "(provider's choice)",
             l1_base,
             l1_base + l1_size,
             l1_size,
+            l1_slices,
             self.num_workers,
+            self._busiest_device_bytes(),
         )
 
     @property
@@ -164,7 +202,7 @@ class ValkeyRdmaWorkerPool(ValkeyWorkerPool):
 
     @property
     def l1_arena_bytes(self) -> int:
-        """Bytes of L1 arena each worker registered."""
+        """Size of the L1 arena in bytes."""
         return self._l1_size
 
     # ------------------------------------------------------------------
@@ -172,7 +210,7 @@ class ValkeyRdmaWorkerPool(ValkeyWorkerPool):
     # ------------------------------------------------------------------
 
     def _get_client(self) -> Any:
-        """Return the calling thread's client, with the arena registered on it.
+        """Return the calling thread's client, with its lane's slice registered.
 
         The RDMA support checks run before the first client is built on a
         thread, so an unusable machine fails with a message naming what is
@@ -183,14 +221,16 @@ class ValkeyRdmaWorkerPool(ValkeyWorkerPool):
 
         Raises:
             RuntimeError: If RDMA is unavailable here, or the fabric refuses
-                to register the arena (see :meth:`_registration_failure_message`).
+                to register the slice (see :meth:`_registration_failure_message`).
         """
         if getattr(self._local, "client", None) is None:
             self._require_rdma_support()
         client = super()._get_client()
         if getattr(self._local, "region", None) is None:
             try:
-                self._local.region = client.register_rdma_region(self._l1_memory)
+                self._local.region = client.register_rdma_region(
+                    self._slice_memory[self._local.lane]
+                )
             except Exception as exc:
                 raise RuntimeError(self._registration_failure_message(exc)) from exc
         return client
@@ -210,15 +250,13 @@ class ValkeyRdmaWorkerPool(ValkeyWorkerPool):
 
     def _interface_for_this_worker(self) -> Optional[str]:
         """The fabric domain this worker's client opens: the interfaces taken
-        round-robin in client-creation order, or ``None`` if unpinned."""
+        round-robin by worker index, or ``None`` if unpinned.
+
+        Consecutive workers of a lane take consecutive interfaces, so a slice
+        with as many workers as there are interfaces is on every device."""
         if not self._rdma_interfaces:
             return None
-        index = getattr(self._local, "client_index", None)
-        if index is None:
-            with self._client_index_lock:
-                index = self._next_client_index
-                self._next_client_index += 1
-            self._local.client_index = index
+        index = self._local.worker_index
         interface = self._rdma_interfaces[index % len(self._rdma_interfaces)]
         logger.debug(
             "Valkey RDMA worker %s opens interface %s",
@@ -250,7 +288,7 @@ class ValkeyRdmaWorkerPool(ValkeyWorkerPool):
             data: Writable buffer inside the L1 arena holding the value.
 
         Raises:
-            ValueError: If ``data`` is empty or outside the arena.
+            ValueError: If ``data`` is empty or not inside the worker's slice.
             RdmaError: If the server refuses the write.
         """
         view, offset = self._window(data)
@@ -281,7 +319,7 @@ class ValkeyRdmaWorkerPool(ValkeyWorkerPool):
             absent or its value is smaller than the buffer.
 
         Raises:
-            ValueError: If ``buf`` is outside the arena.
+            ValueError: If ``buf`` is not inside the worker's slice.
             RdmaError: If the value is larger than ``buf`` or the transfer
                 fails.
         """
@@ -349,29 +387,47 @@ class ValkeyRdmaWorkerPool(ValkeyWorkerPool):
             )
 
     def _registration_failure_message(self, exc: Exception) -> str:
-        """Explain a failed arena registration in terms the operator can act on.
+        """Explain a failed slice registration in terms the operator can act on.
 
         The usual cause is the device's cap on total registered memory: every
-        worker registers the whole arena, and on EFA the cap is the device's
-        ``max_mr_size``, which libfabric reports only as ENOMEM.
+        worker registers its lane's slice of the arena (the whole arena with
+        one slice), and on EFA the cap is the device's ``max_mr_size``, which
+        libfabric reports only as ENOMEM.
         """
-        total_gib = self._l1_size * self.num_workers / (1 << 30)
+        start, end = self._slices[self._local.lane]
+        device_gib = self._busiest_device_bytes() / (1 << 30)
         return (
-            f"Registering the L1 arena ({self._l1_size >> 20} MiB) with the fabric "
-            f"failed: {exc}. Each of the {self.num_workers} workers registers the "
-            f"whole arena, {total_gib:.1f} GiB in total, and the fabric device caps "
-            "total registered memory (on EFA, at its max_mr_size; see "
-            "`ibv_devinfo -v`). Lower num_workers or --l1-size-gb so their product "
-            "fits, and check `ulimit -l` is unlimited."
+            f"Registering L1 slice {self._local.lane} ({(end - start) >> 20} MiB "
+            f"of a {self._l1_size >> 20} MiB arena) with the fabric failed: "
+            f"{exc}. Each of the {self.num_workers} workers registers one of "
+            f"{len(self._slices)} slice(s), {device_gib:.1f} GiB on the busiest "
+            "fabric device, and the device caps total registered memory (on "
+            "EFA, at its max_mr_size; see `ibv_devinfo -v`). Raise "
+            "rdma_l1_slices, list more devices in rdma_interface, or lower "
+            "num_workers or --l1-size-gb so that fits, and check `ulimit -l` "
+            "is unlimited."
         )
 
+    def _busiest_device_bytes(self) -> int:
+        """Bytes registered on the fabric device that holds the most.
+
+        Worker ``w`` registers slice ``w // workers_per_lane`` on interface
+        ``w % len(interfaces)``; with no interface listed, every worker is
+        counted on one device.
+        """
+        devices = [0] * max(len(self._rdma_interfaces), 1)
+        for worker in range(self.num_workers):
+            start, end = self._slices[worker // self._workers_per_lane]
+            devices[worker % len(devices)] += end - start
+        return max(devices)
+
     def _region(self) -> Any:
-        """Return the calling thread's arena registration, creating it if needed."""
+        """Return the calling thread's slice registration, creating it if needed."""
         self._get_client()
         return self._local.region
 
     def _drop_region(self) -> None:
-        """Deregister the calling thread's arena registration, if any."""
+        """Deregister the calling thread's slice registration, if any."""
         region = getattr(self._local, "region", None)
         if region is None:
             return
@@ -381,19 +437,24 @@ class ValkeyRdmaWorkerPool(ValkeyWorkerPool):
         except Exception as exc:
             logger.debug("Error closing per-thread RDMA region: %s", exc)
 
-    def _window(self, buf: Any) -> tuple[memoryview, int]:
-        """Locate ``buf`` inside the registered arena.
+    def _lane_for(self, buf: Any) -> int:
+        """The lane of the slice ``buf`` starts in.
 
-        Args:
-            buf: A writable buffer.
+        That slice reaches furthest past ``buf``'s start, so it is the one
+        that can hold it. A buffer that cannot be addressed goes to lane 0,
+        whose worker fails it with the reason (see :meth:`_window`).
+        """
+        try:
+            _, offset = self._arena_offset(buf)
+        except ValueError:
+            return 0
+        return min(max(offset, 0) // self._slice_stride, len(self._slices) - 1)
 
-        Returns:
-            ``buf`` as a ``"B"`` memoryview, and its offset from the arena
-            base.
+    def _arena_offset(self, buf: Any) -> tuple[memoryview, int]:
+        """``buf`` as a ``"B"`` memoryview, and its offset from the arena base.
 
         Raises:
-            ValueError: If ``buf`` is read-only or outside the arena, which
-                nothing registered can reach.
+            ValueError: If ``buf`` is read-only, so not arena memory.
         """
         view = buf if isinstance(buf, memoryview) else memoryview(buf)
         if view.format != "B":
@@ -404,15 +465,40 @@ class ValkeyRdmaWorkerPool(ValkeyWorkerPool):
                 "be transferred over RDMA"
             )
         address = ctypes.addressof(ctypes.c_char.from_buffer(view))
-        offset = address - self._l1_base
+        return view, address - self._l1_base
+
+    def _window(self, buf: Any) -> tuple[memoryview, int]:
+        """Locate ``buf`` inside the calling worker's registered slice.
+
+        Args:
+            buf: A writable buffer.
+
+        Returns:
+            ``buf`` as a ``"B"`` memoryview, and its offset from the slice
+            start.
+
+        Raises:
+            ValueError: If ``buf`` is read-only, outside the arena, or not
+                wholly inside this worker's slice, which nothing it registered
+                can reach.
+        """
+        view, offset = self._arena_offset(buf)
         if offset < 0 or offset + view.nbytes > self._l1_size:
             raise ValueError(
-                f"buffer at {address:#x} ({view.nbytes} bytes) is outside the "
-                f"registered L1 arena [{self._l1_base:#x}, "
+                f"buffer at {self._l1_base + offset:#x} ({view.nbytes} bytes) is "
+                f"outside the registered L1 arena [{self._l1_base:#x}, "
                 f"{self._l1_base + self._l1_size:#x}), so it cannot be "
                 "transferred over RDMA"
             )
-        return view, offset
+        start, end = self._slices[self._local.lane]
+        if offset < start or offset + view.nbytes > end:
+            raise ValueError(
+                f"buffer at arena offset {offset:#x} ({view.nbytes} bytes) is not "
+                f"inside L1 slice {self._local.lane} [{start:#x}, {end:#x}), so "
+                "it cannot be transferred over RDMA; rdma_l1_slice_overlap_mb "
+                f"must be at least the largest object ({view.nbytes} bytes here)"
+            )
+        return view, offset - start
 
     def _transfer(self, operate: Callable[[Any], T]) -> T:
         """Run ``operate`` against the thread's region, re-registering once.
@@ -438,7 +524,7 @@ class ValkeyRdmaWorkerPool(ValkeyWorkerPool):
             if "revoked" not in str(exc):
                 raise
             logger.warning(
-                "RDMA region on %s was revoked (%s); registering the L1 arena again",
+                "RDMA region on %s was revoked (%s); registering its L1 slice again",
                 threading.current_thread().name,
                 exc,
             )

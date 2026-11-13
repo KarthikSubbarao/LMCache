@@ -109,7 +109,8 @@ populates it in steps, and registering unpopulated pages is untested (the
 L1 manager carries a TODO to that effect).
 
 Each worker registers the **whole arena, once**, with its own client's
-fabric. The registration is a `ctypes` overlay over the descriptor's
+fabric, unless the arena is sliced (see [L1 slices](#l1-slices)). The
+registration is a `ctypes` overlay over the descriptor's
 pointer that satisfies the buffer protocol; nothing is copied or owned. A
 worker thread that was not exercised during warm-up registers on its first
 operation, exactly as it builds its client.
@@ -123,12 +124,64 @@ them.
 
 In device capacity it is the one hard constraint of this design: the EFA
 device caps **total** registered memory at its `max_mr_size`, and every
-worker's registration counts against it. Measured: 384 GiB on c8gn.16xlarge
-(8 × 32 GiB fits), 96 GiB on g6.8xlarge (8 × 16 GiB does not; the sixth
-16 GiB registration fails with ENOMEM). libfabric reports the overflow only
-as `fi_mr_reg: Cannot allocate memory`, so the pool wraps a failed
-registration in a `RuntimeError` that states `num_workers × arena` and what
-to shrink. `num_workers × l1_size_gb` must be sized against the device.
+registration of a worker on that device counts against it. Measured: 384 GiB
+on c8gn.16xlarge (8 × 32 GiB fits), 96 GiB on g6.8xlarge (8 × 16 GiB does
+not; the sixth 16 GiB registration fails with ENOMEM). On p5en the cap is
+192 GiB per device.
+libfabric reports the overflow only as `fi_mr_reg: Cannot allocate memory`,
+so the pool wraps a failed registration in a `RuntimeError` that states the
+bytes registered on the busiest device and what to change. Unsliced, a
+device holds `l1_size_gb` once for each worker that opens it, so
+`(workers per device) × l1_size_gb` must be below `max_mr_size`.
+
+### L1 slices
+
+`rdma_l1_slices: n` cuts the arena into `n` slices and the workers into `n`
+lanes of `num_workers / n` workers; a lane's workers register only its
+slice. glide still needs one registration per worker (a region belongs to
+one client and carries one transfer at a time); slicing only makes each
+registration smaller.
+
+```text
+stride  = ceil(l1_size / n), rounded up to 4 KiB
+slice i = [i × stride, min((i + 1) × stride + overlap, l1_size))
+worker w: lane w // (num_workers / n), interface w % len(rdma_interface)
+```
+
+**Why an overlap.** The L1 allocator is first-fit over the whole arena
+with only `align_bytes` (4 KiB by default) alignment
+(`AddressManager.allocate` in `lmcache/v1/memory_management.py`), and
+objects of different layouts have different sizes, so an object can start
+at any aligned offset and cross any fixed boundary. A transfer is one
+window of one region and cannot be split across two. Slice `i` therefore
+reaches `rdma_l1_slice_overlap_mb` into slice `i + 1`: every object no
+larger than the overlap that starts in slice `i` lies wholly inside it.
+The overlap must be at least the largest KV chunk; an object larger than
+that which crosses a boundary fails its key with a message saying so, like
+an out-of-arena buffer.
+
+**Routing.** The pool computes the lane from the buffer's arena offset
+(`offset // stride`): the slice the buffer starts in, which is the one
+reaching furthest past it. A SET or GET is queued on that lane's executor,
+so a busy slice queues on its own workers while other lanes keep running;
+a lane of `k` workers keeps `k` transfers of that slice in flight. Batch
+operations are per-key futures, so each key of a batch is routed on its
+own. `EXISTS` and `DEL` carry no buffer and take the lanes in turn.
+
+**Per-device math.** Consecutive workers of a lane take consecutive
+interfaces, so with `k = num_workers / n` workers per lane and `d`
+interfaces, `k = d` puts every slice once on every device:
+
+```text
+busiest device ≈ l1_size × k / d + overlaps
+```
+
+Example: L1 = 200 GB, 16 workers, 4 EFA devices on p5en. Unsliced, each
+device holds 4 × 200 GB = 800 GB, over its 192 GiB `max_mr_size`. With
+`rdma_l1_slices: 4` and a 256 MiB overlap, each device holds four
+different 50 GB slices, 200 GB + 3 × 256 MiB ≈ 187 GiB, and each slice
+still has 4 workers, one per device. The pool logs the exact busiest-device
+bytes at start-up.
 
 ## Window derivation
 
@@ -137,7 +190,7 @@ object's logical bytes at `obj.data_ptr`, for both SET and GET. The RDMA
 pool locates that view inside the arena:
 
 ```text
-offset = address(view) - l1_base
+offset = address(view) - l1_base - slice_start   # slice_start is 0 unsliced
 window = region.window(offset, len(view))
 ```
 
@@ -177,7 +230,7 @@ expiry argument.
 destination chunk is refused by the server before any write is posted. This
 matters more here than in the `valkey` adapter: there, an oversized value
 lands in glide's scratch buffer and is dropped; here, every worker's region
-is the whole arena, so an unchecked write would run past the chunk into the
+is the whole arena or a slice of it, so an unchecked write would run past the chunk into the
 L1 slab that follows it. The client can only detect that afterwards, from
 the receipt's byte count, which is too late.
 
@@ -193,18 +246,19 @@ returning, so a load that reports a hit has also been checksummed.
 | Failure | Per-key bit | Logged | Notes |
 |---------|-------------|--------|-------|
 | Buffer outside the arena | `False` | `WARNING` | No transfer attempted. Other keys in the batch unaffected. |
+| Buffer crossing the end of its slice (larger than the overlap) | `False` | `WARNING` | No transfer attempted; the message names `rdma_l1_slice_overlap_mb`. |
 | Value larger than the window | `False` | `WARNING` | Refused by the server; nothing written. |
 | Value smaller than the window | `False` | `WARNING` | Landed, but rejected as a miss. |
 | Server error reply (`ERR ...`) | `False` | `WARNING` | Region stays usable. |
 | Transfer fails without a reply (connection drop, fabric error) | `False` | `WARNING` | glide **revokes** the region; see below. |
-| Next transfer through a revoked region | retried once | `WARNING` | Worker deregisters, registers the arena again, retries. |
+| Next transfer through a revoked region | retried once | `WARNING` | Worker deregisters, registers its slice again, retries. |
 | Client closed mid-transfer | `False` | `WARNING` | `ClosingError`; only during `close()`. |
 | Missing RDMA support / libfabric / module | construction fails | (raises) | Actionable message naming the piece. |
 
 **Revoked regions.** glide revokes a region when a transfer fails for any
 reason other than a reply from the server, because the server may still be
 using the memory. The next transfer through that region is refused as
-revoked, and only then does the worker register the arena again and retry
+revoked, and only then does the worker register its slice again and retry
 the operation once. A server's own error reply leaves the region usable, so
 it never costs a registration.
 
@@ -241,7 +295,9 @@ JSON schema (CLI `--l2-adapter`); every `valkey` field is accepted, plus:
 |-------|---------|---------|
 | `transport` | `"tcp"` | `"rdma"` selects this transport. |
 | `rdma_provider` | `"efa-direct"` | `"efa-direct"` opens EFA hardware; `"tcp"` opens libfabric's software provider, for development and tests only. |
-| `rdma_interface` | unset | Fabric domain, or list of domains, to open on a host with more than one card, named as `fi_info -p efa` lists them. Workers take a list round-robin in client-creation order, so a list of `k` cards with `num_workers` a multiple of `k` puts the same number of transfers in flight on each card, and each card's registered-memory cap applies to its own workers only. One domain, or none, sends every worker through one card. |
+| `rdma_l1_slices` | `1` | Slices to cut the L1 arena into; each worker registers one slice instead of the whole arena (see [L1 slices](#l1-slices)). `num_workers` must be a multiple of it. |
+| `rdma_l1_slice_overlap_mb` | unset | MiB each slice reaches into the next; required with `rdma_l1_slices > 1`, and at least the largest KV chunk. |
+| `rdma_interface` | unset | Fabric domain, or list of domains, to open on a host with more than one card, named as `fi_info -p efa` lists them. Workers take a list round-robin by worker index, so a list of `k` cards with `num_workers` a multiple of `k` puts the same number of transfers in flight on each card, and each card's registered-memory cap applies to its own workers only. One domain, or none, sends every worker through one card. |
 
 ## Non-goals
 
@@ -262,9 +318,11 @@ JSON schema (CLI `--l2-adapter`); every `valkey` field is accepted, plus:
 - `tests/v1/distributed/test_valkey_l2_adapter_rdma.py` — unit tests
   against an in-process fake of glide's RDMA API. The fake records every
   registration and every transfer window, so the tests assert that each
-  worker registers the whole arena, that each window is the object's own
-  offset and size, and that bytes land in and are read from the arena
-  tensor directly.
+  worker registers the whole arena (or, sliced, its own slice on its own
+  device), that each window is the object's own offset and size within it,
+  that a batch is routed key by key to the slice holding each object, that
+  an object crossing a slice boundary is held by the overlap, and that bytes
+  land in and are read from the arena tensor directly.
 - `tests/v1/distributed/test_valkey_l2_adapter_rdma_integration.py` —
   real transfers against a valkey-server running the module with the
   `Emulated` fabric provider and `valkey-glide-sync` built with RDMA, using

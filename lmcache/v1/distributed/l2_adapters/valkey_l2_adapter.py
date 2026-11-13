@@ -201,6 +201,15 @@ class ValkeyL2AdapterConfig(L2AdapterConfigBase):
       * ``rdma_interface``: Fabric domain, or list of domains, to open on
         a multi-card host; workers are spread across them round-robin.
         RDMA only.
+      * ``rdma_l1_slices``: Slices to cut the L1 arena into. ``1``
+        (default) has every worker register the whole arena; with ``n``
+        each worker registers one slice (``num_workers`` must be a multiple
+        of ``n``, so every slice has the same number of workers) and each
+        SET/GET runs on a worker of the slice holding its object. RDMA only.
+      * ``rdma_l1_slice_overlap_mb``: MiB each slice reaches into the next;
+        required with ``rdma_l1_slices > 1`` and must be at least the
+        largest KV object (chunk), since the L1 allocator can place an
+        object across a slice boundary. RDMA only.
     """
 
     def __init__(
@@ -220,6 +229,8 @@ class ValkeyL2AdapterConfig(L2AdapterConfigBase):
         transport: str = "tcp",
         rdma_provider: str = DEFAULT_RDMA_PROVIDER,
         rdma_interface: Optional[Union[str, Sequence[str]]] = None,
+        rdma_l1_slices: int = 1,
+        rdma_l1_slice_overlap_mb: Optional[int] = None,
     ) -> None:
         """Initialize a ValkeyL2AdapterConfig with validated fields.
 
@@ -248,6 +259,10 @@ class ValkeyL2AdapterConfig(L2AdapterConfigBase):
             rdma_provider: ``"efa-direct"`` or ``"tcp"``; RDMA only.
             rdma_interface: Optional fabric domain or domains; each must be
                 a non-empty string. RDMA only.
+            rdma_l1_slices: Slices of the L1 arena; a positive divisor of
+                ``num_workers``. RDMA only.
+            rdma_l1_slice_overlap_mb: Positive MiB each slice reaches into
+                the next; required with ``rdma_l1_slices > 1``. RDMA only.
 
         Raises:
             ValueError: If any validation fails (empty
@@ -320,6 +335,28 @@ class ValkeyL2AdapterConfig(L2AdapterConfigBase):
                 f"rdma_provider must be one of {RDMA_PROVIDERS}, got {rdma_provider!r}"
             )
         rdma_interfaces = normalize_rdma_interfaces(rdma_interface)
+        if (
+            isinstance(rdma_l1_slices, bool)
+            or not isinstance(rdma_l1_slices, int)
+            or rdma_l1_slices <= 0
+        ):
+            raise ValueError("rdma_l1_slices must be a positive integer")
+        if num_workers % rdma_l1_slices:
+            raise ValueError(
+                f"num_workers ({num_workers}) must be a multiple of "
+                f"rdma_l1_slices ({rdma_l1_slices})"
+            )
+        if rdma_l1_slice_overlap_mb is not None and (
+            isinstance(rdma_l1_slice_overlap_mb, bool)
+            or not isinstance(rdma_l1_slice_overlap_mb, int)
+            or rdma_l1_slice_overlap_mb <= 0
+        ):
+            raise ValueError("rdma_l1_slice_overlap_mb must be a positive integer")
+        if rdma_l1_slices > 1 and rdma_l1_slice_overlap_mb is None:
+            raise ValueError(
+                "rdma_l1_slice_overlap_mb is required with rdma_l1_slices > 1; "
+                "set it to at least the largest KV chunk in MiB"
+            )
 
         self.startup_nodes: list[tuple[str, int]] = startup_nodes
         self.cluster_mode: bool = cluster_mode
@@ -336,6 +373,8 @@ class ValkeyL2AdapterConfig(L2AdapterConfigBase):
         self.transport: str = transport
         self.rdma_provider: str = rdma_provider
         self.rdma_interfaces: tuple[str, ...] = rdma_interfaces
+        self.rdma_l1_slices: int = rdma_l1_slices
+        self.rdma_l1_slice_overlap_mb: Optional[int] = rdma_l1_slice_overlap_mb
 
     @property
     def uses_rdma(self) -> bool:
@@ -427,6 +466,9 @@ class ValkeyL2AdapterConfig(L2AdapterConfigBase):
             "transport": transport_raw,
             "rdma_provider": provider_raw,
             "rdma_interface": interface_raw,
+            # Validated by __init__.
+            "rdma_l1_slices": d.get("rdma_l1_slices", 1),
+            "rdma_l1_slice_overlap_mb": d.get("rdma_l1_slice_overlap_mb"),
         }
 
     @classmethod
@@ -478,7 +520,13 @@ class ValkeyL2AdapterConfig(L2AdapterConfigBase):
             "- rdma_interface (str or list of str, optional): fabric domain or "
             "domains to open on a host with more than one card; workers are "
             "spread across a list round-robin. Omit to let the provider "
-            "choose. RDMA only."
+            "choose. RDMA only.\n"
+            "- rdma_l1_slices (int, default 1): slices to cut the L1 arena "
+            "into; each worker registers one slice instead of the whole arena, "
+            "and num_workers must be a multiple of it. RDMA only.\n"
+            "- rdma_l1_slice_overlap_mb (int, required with rdma_l1_slices > "
+            "1): MiB each slice reaches into the next; at least the largest "
+            "KV chunk. RDMA only."
         )
 
 
@@ -630,6 +678,8 @@ class ValkeyL2Adapter(L2AdapterInterface):
             l1_size=self._l1_memory_desc.size,
             rdma_provider=config.rdma_provider,
             rdma_interface=config.rdma_interfaces or None,
+            l1_slices=config.rdma_l1_slices,
+            l1_slice_overlap=(config.rdma_l1_slice_overlap_mb or 0) << 20,
             **self._pool_kwargs(config),
         )
 

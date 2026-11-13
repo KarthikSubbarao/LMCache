@@ -348,12 +348,18 @@ class _Arena:
         )
         self._next = 0
 
-    def alloc(self, nbytes: int = 256, fill: float = 1.0) -> TensorMemoryObj:
+    def alloc(
+        self, nbytes: int = 256, fill: float = 1.0, at: Optional[int] = None
+    ) -> TensorMemoryObj:
+        """Carve the next object out of the arena, or one at offset ``at``."""
         assert nbytes % 4 == 0
-        offset = self._next
         phy_size = -(-nbytes // self.align) * self.align
-        self._next += phy_size
-        assert self._next <= self.desc.size, "arena exhausted"
+        if at is None:
+            offset = self._next
+            self._next += phy_size
+        else:
+            offset = at
+        assert offset + phy_size <= self.desc.size, "arena exhausted"
         raw = self.tensor[offset : offset + nbytes].view(torch.float32)
         raw.fill_(fill)
         meta = MemoryObjMetadata(
@@ -500,6 +506,25 @@ class TestConfig:
         assert cfg.uses_rdma
         assert cfg.rdma_provider == "efa-direct"
         assert cfg.rdma_interfaces == ()
+        assert cfg.rdma_l1_slices == 1
+        assert cfg.rdma_l1_slice_overlap_mb is None
+
+    @pytest.mark.parametrize(
+        "overrides, match",
+        [
+            ({"rdma_l1_slices": 0}, "rdma_l1_slices"),
+            ({"rdma_l1_slices": True}, "rdma_l1_slices"),
+            ({"rdma_l1_slices": 3, "rdma_l1_slice_overlap_mb": 1}, "multiple"),
+            ({"rdma_l1_slices": 2}, "rdma_l1_slice_overlap_mb is required"),
+            (
+                {"rdma_l1_slices": 2, "rdma_l1_slice_overlap_mb": 0},
+                "rdma_l1_slice_overlap_mb",
+            ),
+        ],
+    )
+    def test_rejects_bad_slicing(self, overrides: dict, match: str):
+        with pytest.raises(ValueError, match=match):
+            _make_config(num_workers=4, **overrides)
 
     def test_rejects_unknown_transport(self):
         with pytest.raises(ValueError, match="transport"):
@@ -535,6 +560,8 @@ class TestConfig:
                 "ttl_seconds": 60,
                 "rdma_provider": "tcp",
                 "rdma_interface": "efa0",
+                "rdma_l1_slices": 3,
+                "rdma_l1_slice_overlap_mb": 64,
             }
         )
         assert cfg.startup_nodes == [("h1", 6379), ("h2", 6380)]
@@ -543,6 +570,8 @@ class TestConfig:
         assert cfg.uses_rdma
         assert cfg.rdma_provider == "tcp"
         assert cfg.rdma_interfaces == ("efa0",)
+        assert cfg.rdma_l1_slices == 3
+        assert cfg.rdma_l1_slice_overlap_mb == 64
 
     def test_from_dict_accepts_a_list_of_interfaces(self):
         cfg = ValkeyL2AdapterConfig.from_dict(
@@ -565,6 +594,8 @@ class TestConfig:
             ("rdma_interface", 7),
             ("rdma_interface", ["efa0", 7]),
             ("rdma_provider", "verbs"),
+            ("rdma_l1_slices", "2"),
+            ("rdma_l1_slice_overlap_mb", "64"),
         ],
     )
     def test_from_dict_rejects_bad_rdma_values(self, field: str, value: Any):
@@ -577,6 +608,8 @@ class TestConfig:
         assert "transport" in text
         assert "rdma_provider" in text
         assert "rdma_interface" in text
+        assert "rdma_l1_slices" in text
+        assert "rdma_l1_slice_overlap_mb" in text
 
     def test_is_the_valkey_type_whatever_the_transport(self):
         assert get_type_name_for_config(_make_config()) == "valkey"
@@ -651,6 +684,7 @@ class TestSupportChecks:
             ValkeyL2Adapter(_make_config(num_workers=3), arena.desc)
         message = str(raised.value)
         assert "3 workers" in message
+        assert "slice 0" in message
         assert "fi_mr_reg" in message
         assert isinstance(raised.value.__cause__, RdmaError)
 
@@ -989,3 +1023,201 @@ class TestWindowDerivation:
         pool.submit_set("direct", view).result(timeout=5)
         assert _transfers("set")[-1] == (b"direct", 4096, 64)
         assert _SERVER.store[b"direct"] == bytes(range(64))
+
+
+# ===========================================================================
+# L1 slices
+# ===========================================================================
+
+MIB = 1 << 20
+SLICED_ARENA_BYTES = 4 * MIB
+# The sliced adapter below: two slices 2 MiB apart, each reaching 1 MiB into
+# the next, so [0, 3) MiB and [2, 4) MiB.
+SLICES = [(0, 3 * MIB), (2 * MIB, 4 * MIB)]
+
+
+@pytest.fixture
+def big_arena() -> _Arena:
+    return _Arena(size=SLICED_ARENA_BYTES)
+
+
+def _sliced_adapter(arena: _Arena, **overrides: Any) -> ValkeyL2Adapter:
+    fields: dict[str, Any] = {
+        "num_workers": 4,
+        "rdma_l1_slices": 2,
+        "rdma_l1_slice_overlap_mb": 1,
+    }
+    fields.update(overrides)
+    return ValkeyL2Adapter(_make_config(**fields), arena.desc)
+
+
+def _slice_of(region: _FakeRegion, arena: _Arena) -> tuple[int, int]:
+    """The ``[start, end)`` arena offsets a registration covers."""
+    start = ctypes.addressof(region._memory) - arena.desc.ptr  # noqa: SLF001
+    return start, start + region.capacity
+
+
+class TestL1Slices:
+    def test_each_worker_registers_only_its_slice_on_every_device(
+        self, big_arena: _Arena
+    ):
+        adapter = _sliced_adapter(big_arena, rdma_interface=["efa0", "efa1"])
+        try:
+            # Hold four stores in flight at once, two per slice, so every
+            # worker has to build its client and register.
+            gate = threading.Barrier(4)
+            _SERVER.faults["set"] = lambda key: (gate.wait(timeout=5), None)[1]
+            offsets = [0, ALIGN, 2 * MIB, 2 * MIB + ALIGN]
+            objs = [big_arena.alloc(at=off) for off in offsets]
+            keys = [_key(i) for i in range(4)]
+            assert _store(adapter, keys, objs).is_successful()
+
+            registered = Counter(
+                (_slice_of(r, big_arena), r.client.config[1]["rdma"].interface)
+                for r in _SERVER.registrations
+            )
+            # Two workers per slice, one on each device: each device holds
+            # the arena once plus the overlap, not the arena twice.
+            assert registered == {
+                (SLICES[0], "efa0"): 1,
+                (SLICES[0], "efa1"): 1,
+                (SLICES[1], "efa0"): 1,
+                (SLICES[1], "efa1"): 1,
+            }
+        finally:
+            adapter.close()
+
+    def test_a_batch_is_routed_to_the_slices_holding_its_objects(
+        self, big_arena: _Arena
+    ):
+        adapter = _sliced_adapter(big_arena)
+        try:
+            # Two objects in each slice, one of them inside the overlap the
+            # other slice also registers.
+            at = [0, MIB + MIB // 2, 2 * MIB + ALIGN, 3 * MIB + MIB // 2]
+            sources = [
+                big_arena.alloc(256, fill=float(i + 1), at=off)
+                for i, off in enumerate(at)
+            ]
+            keys = [_key(i) for i in range(len(sources))]
+            wires = [adapter._wire_key(k).encode() for k in keys]  # noqa: SLF001
+
+            assert _store(adapter, keys, sources).is_successful()
+
+            # Each window is relative to the slice the object starts in.
+            windows = {k: off for k, off, _ in _transfers("set")}
+            for wire, off, src in zip(wires, at, sources, strict=True):
+                assert windows[wire] == off - SLICES[off // (2 * MIB)][0]
+                assert _SERVER.store[wire] == big_arena.bytes_of(src)
+
+            dst_at = [2 * ALIGN, 2 * MIB + 2 * ALIGN, 3 * ALIGN, 3 * MIB]
+            destinations = [big_arena.alloc(256, fill=0.0, at=off) for off in dst_at]
+            bitmap = _load(adapter, keys, destinations)
+
+            for i, (src, dst) in enumerate(zip(sources, destinations, strict=True)):
+                assert bitmap.test(i)
+                assert big_arena.bytes_of(dst) == big_arena.bytes_of(src)
+        finally:
+            adapter.close()
+
+    def test_an_object_across_a_slice_boundary_is_held_by_the_overlap(
+        self, big_arena: _Arena
+    ):
+        adapter = _sliced_adapter(big_arena)
+        try:
+            # Starts in slice 0 and ends in slice 1: within slice 0's overlap.
+            across = big_arena.alloc(2 * ALIGN, at=2 * MIB - ALIGN)
+            # Larger than the overlap, so no slice holds all of it.
+            too_big = big_arena.alloc(MIB + 2 * ALIGN, at=2 * MIB - ALIGN)
+            # Ends at the end of the arena, in the last slice.
+            last = big_arena.alloc(ALIGN, at=SLICED_ARENA_BYTES - ALIGN)
+            keys = [_key(1), _key(2), _key(3)]
+            wires = [adapter._wire_key(k).encode() for k in keys]  # noqa: SLF001
+
+            result = _store(adapter, keys, [across, too_big, last])
+
+            assert not result.is_successful()
+            assert wires[0] in _SERVER.store and wires[2] in _SERVER.store
+            assert wires[1] not in _SERVER.store
+            # Only the oversized object fails, and without a transfer.
+            windows = {k: off for k, off, _ in _transfers("set")}
+            assert windows == {
+                wires[0]: 2 * MIB - ALIGN,
+                wires[2]: SLICED_ARENA_BYTES - ALIGN - SLICES[1][0],
+            }
+        finally:
+            adapter.close()
+
+    def test_a_busy_slice_queues_on_its_own_workers(self, big_arena: _Arena):
+        adapter = _sliced_adapter(big_arena)
+        try:
+            release = threading.Event()
+            slice0 = [_key(i) for i in range(3)]
+            blocked = {adapter._wire_key(k).encode() for k in slice0}  # noqa: SLF001
+            _SERVER.faults["set"] = lambda key: (
+                release.wait(timeout=5) if key in blocked else None,
+                None,
+            )[1]
+            held = adapter.submit_store_task(
+                slice0, [big_arena.alloc(at=i * ALIGN) for i in range(3)]
+            )
+
+            # The other slice's workers are free.
+            other = big_arena.alloc(at=3 * MIB)
+            assert _store(adapter, [_key(9)], [other]).is_successful()
+
+            # Slice 0's two workers both run a transfer; the third waits for
+            # one of them rather than going to slice 1's idle workers.
+            def started() -> list[bytes]:
+                return [k for k, _, _ in _transfers("set") if k in blocked]
+
+            deadline = time.monotonic() + 5
+            while len(started()) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.1)
+            assert len(started()) == 2
+
+            release.set()
+            result = _wait(
+                adapter.get_store_event_fd(),
+                lambda: adapter.pop_completed_store_tasks().get(held),
+            )
+            assert result.is_successful()
+            assert len(started()) == 3
+        finally:
+            release.set()
+            adapter.close()
+
+    @pytest.mark.parametrize(
+        "workers, slices, interfaces, expected_mib",
+        [
+            # One slice: every worker registers the whole 4 MiB arena.
+            (4, 1, None, 16),
+            # Slices [0,3) and [2,4) MiB, one worker of each per device.
+            (4, 2, ["efa0", "efa1"], 5),
+            # Slices [0,2), [1,3), [2,4), [3,4) MiB, four workers each, one
+            # per device: each device holds every slice once.
+            (16, 4, ["efa0", "efa1", "efa2", "efa3"], 7),
+            # Two workers per slice: a device holds two of the four slices.
+            (8, 4, ["efa0", "efa1", "efa2", "efa3"], 4),
+        ],
+    )
+    def test_the_busiest_device_counts_the_slices_its_workers_register(
+        self,
+        big_arena: _Arena,
+        workers: int,
+        slices: int,
+        interfaces: Optional[list[str]],
+        expected_mib: int,
+    ):
+        adapter = _sliced_adapter(
+            big_arena,
+            num_workers=workers,
+            rdma_l1_slices=slices,
+            rdma_interface=interfaces,
+        )
+        try:
+            pool = adapter._pool  # noqa: SLF001
+            assert pool._busiest_device_bytes() == expected_mib * MIB  # noqa: SLF001
+        finally:
+            adapter.close()

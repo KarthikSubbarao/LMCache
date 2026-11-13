@@ -30,6 +30,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Optional
 import inspect
+import itertools
 import threading
 
 # First Party
@@ -162,9 +163,14 @@ class ValkeyWorkerPool:
             seconds) so Valkey/Redis ``volatile-*`` eviction policies can
             reclaim cache keys under memory pressure. ``None`` (default)
             disables TTL — keys are persisted without expiry.
+        num_lanes: Number of independent queues the workers are split into,
+            ``num_workers / num_lanes`` workers each. A SET or GET runs on the
+            lane :meth:`_lane_for` picks for its buffer; other operations
+            take the lanes in turn. ``1`` (default) is one shared queue.
 
     Raises:
-        ValueError: If ``addresses`` is empty or ``num_workers <= 0``.
+        ValueError: If ``addresses`` is empty, ``num_workers <= 0``, or
+            ``num_workers`` is not a multiple of ``num_lanes``.
         RuntimeError: If ``valkey-glide`` is not installed (raised during
             warmup).
     """
@@ -181,13 +187,21 @@ class ValkeyWorkerPool:
         cluster_mode: bool = False,
         database_id: Optional[int] = None,
         ttl_seconds: Optional[int] = None,
+        num_lanes: int = 1,
     ) -> None:
         if not addresses:
             raise ValueError("addresses must contain at least one (host, port)")
         if num_workers <= 0:
             raise ValueError("num_workers must be > 0")
+        if num_lanes <= 0 or num_workers % num_lanes:
+            raise ValueError(
+                f"num_workers ({num_workers}) must be a multiple of the lane "
+                f"count ({num_lanes})"
+            )
 
         self.num_workers: int = num_workers
+        self.num_lanes: int = num_lanes
+        self._workers_per_lane: int = num_workers // num_lanes
         self._addresses: list[tuple[str, int]] = list(addresses)
         self._username: str = username
         self._password: str = password
@@ -212,21 +226,38 @@ class ValkeyWorkerPool:
         self._capability_lock: threading.Lock = threading.Lock()
         self._closed: bool = False
 
-        self._executor: ThreadPoolExecutor = ThreadPoolExecutor(
-            max_workers=num_workers,
-            thread_name_prefix="valkey",
-        )
+        # One executor per lane. Each worker learns its lane and its index
+        # in the pool (``lane * workers_per_lane + n``, in thread start order
+        # within the lane) when its thread starts; see ``_start_worker``.
+        self._lane_started: list[int] = [0] * num_lanes
+        self._lane_lock: threading.Lock = threading.Lock()
+        # Picks a lane for operations that carry no buffer.
+        self._next_lane = itertools.count()
+        self._executors: list[ThreadPoolExecutor] = [
+            ThreadPoolExecutor(
+                max_workers=self._workers_per_lane,
+                thread_name_prefix="valkey",
+                initializer=self._start_worker,
+                initargs=(lane,),
+            )
+            for lane in range(num_lanes)
+        ]
         # Warm up: force each worker to build its client up-front so any
         # connection / auth / missing-dependency error fails fast here
         # rather than on the first real operation.
-        warmup = [self._executor.submit(self._get_client) for _ in range(num_workers)]
+        warmup = [
+            executor.submit(self._get_client)
+            for executor in self._executors
+            for _ in range(self._workers_per_lane)
+        ]
         try:
             for f in warmup:
                 f.result(timeout=connection_timeout)
         except BaseException:
             # No worker may outlive a failed construction: a straggler would
             # keep connecting, or importing, after the caller has given up.
-            self._executor.shutdown(wait=True, cancel_futures=True)
+            for executor in self._executors:
+                executor.shutdown(wait=True, cancel_futures=True)
             raise
 
         logger.info(
@@ -243,6 +274,25 @@ class ValkeyWorkerPool:
     # ------------------------------------------------------------------
     # Client lifecycle
     # ------------------------------------------------------------------
+
+    def _start_worker(self, lane: int) -> None:
+        """Record the starting worker thread's lane and pool index."""
+        with self._lane_lock:
+            n = self._lane_started[lane]
+            self._lane_started[lane] += 1
+        self._local.lane = lane
+        self._local.worker_index = lane * self._workers_per_lane + n
+
+    def _lane_for(self, buf: Any) -> int:
+        """The lane whose workers run a SET or GET on ``buf``; a subclass hook.
+
+        Every worker here can serve every buffer, so this is lane 0.
+        """
+        return 0
+
+    def _any_lane(self) -> ThreadPoolExecutor:
+        """The executor for an operation that carries no buffer, in turn."""
+        return self._executors[next(self._next_lane) % self.num_lanes]
 
     def _get_client(self) -> Any:
         """Return the calling thread's glide client, creating it lazily.
@@ -360,7 +410,7 @@ class ValkeyWorkerPool:
             thread if the capability has not been probed yet.
         """
         if self._has_buffer_get is None:
-            self._executor.submit(self._get_client).result(
+            self._executors[0].submit(self._get_client).result(
                 timeout=self._connection_timeout
             )
         return bool(self._has_buffer_get)
@@ -519,22 +569,24 @@ class ValkeyWorkerPool:
 
     def submit_set(self, key_str: str, data: Any) -> Future:
         """Submit a SET; the future resolves to ``None`` on success."""
-        return self._executor.submit(self._do_set, key_str, data)
+        return self._executors[self._lane_for(data)].submit(self._do_set, key_str, data)
 
     def submit_get_into(self, key_str: str, buf: Any) -> Future:
         """Submit a GET-into-buffer; future resolves to bytes-or-``-1``.
 
         See :meth:`_do_get_into` for the return-value contract.
         """
-        return self._executor.submit(self._do_get_into, key_str, buf)
+        return self._executors[self._lane_for(buf)].submit(
+            self._do_get_into, key_str, buf
+        )
 
     def submit_exists(self, key_str: str) -> Future:
         """Submit an EXISTS; the future resolves to ``bool``."""
-        return self._executor.submit(self._do_exists, key_str)
+        return self._any_lane().submit(self._do_exists, key_str)
 
     def submit_delete(self, key_str: str) -> Future:
         """Submit a DEL; the future resolves to ``bool`` (removed?)."""
-        return self._executor.submit(self._do_delete, key_str)
+        return self._any_lane().submit(self._do_delete, key_str)
 
     # ------------------------------------------------------------------
     # Observability
@@ -559,8 +611,10 @@ class ValkeyWorkerPool:
         if not self._cluster_mode or self._closed:
             return {}
         try:
-            return self._executor.submit(self._do_node_memory).result(
-                timeout=self._request_timeout
+            return (
+                self._any_lane()
+                .submit(self._do_node_memory)
+                .result(timeout=self._request_timeout)
             )
         except Exception as e:
             logger.debug("node_memory_usage query failed: %s", e)
@@ -594,9 +648,9 @@ class ValkeyWorkerPool:
     def _close_local_client(self, barrier: threading.Barrier) -> None:
         """Close the calling thread's client after all workers gather.
 
-        The barrier guarantees every worker thread is simultaneously
-        executing one close task before any proceeds, so each of the N
-        tasks lands on a distinct thread and closes that thread's own
+        The barrier guarantees every worker thread of the lane is
+        simultaneously executing one close task before any proceeds, so each
+        of the lane's tasks lands on a distinct thread and closes that thread's own
         client exactly once. Without it, a fast thread could grab
         multiple close tasks (no-ops after the first) while another
         thread's client is never closed.
@@ -629,20 +683,23 @@ class ValkeyWorkerPool:
 
         Each client is closed on its owning thread (matching glide's
         per-thread client model) with 1:1 coverage guaranteed by a
-        barrier. Idempotent — repeated calls are no-ops.
+        barrier per lane. Idempotent — repeated calls are no-ops.
         """
         if self._closed:
             return
         self._closed = True
-        barrier = threading.Barrier(self.num_workers)
-        close_futs = [
-            self._executor.submit(self._close_local_client, barrier)
-            for _ in range(self.num_workers)
-        ]
+        close_futs = []
+        for executor in self._executors:
+            barrier = threading.Barrier(self._workers_per_lane)
+            close_futs += [
+                executor.submit(self._close_local_client, barrier)
+                for _ in range(self._workers_per_lane)
+            ]
         for f in close_futs:
             try:
                 f.result(timeout=self._connection_timeout)
             except Exception as exc:
                 logger.debug("Error during ValkeyWorkerPool close: %s", exc)
-        self._executor.shutdown(wait=True, cancel_futures=False)
+        for executor in self._executors:
+            executor.shutdown(wait=True, cancel_futures=False)
         logger.info("ValkeyWorkerPool closed")
